@@ -2,7 +2,24 @@ from argparse import ArgumentParser
 from distutils.util import strtobool
 from tqdm import tqdm
 from datasets import load_dataset, DatasetDict, Dataset, IterableDatasetDict, IterableDataset
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration, T5Config, Seq2SeqTrainer, Seq2SeqTrainingArguments, DefaultDataCollator, DataCollatorForSeq2Seq
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForSeq2SeqLM, 
+    T5ForConditionalGeneration, 
+    T5Config, 
+    Seq2SeqTrainer, 
+    Seq2SeqTrainingArguments, 
+    DefaultDataCollator, 
+    DataCollatorForSeq2Seq,
+    # EarlyStoppingCallback,
+    TrainerCallback,
+    TrainingArguments,
+    TrainerState,
+    TrainerControl
+)
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+from transformers.utils import is_sagemaker_mp_enabled
+from transformers.generation.configuration_utils import GenerationConfig
 #from transformers import SchedulerType, DataCollatorForLanguageModeling, DataCollatorForPermutationLanguageModeling, DataCollatorForSeq2Seq, DataCollatorWithPadding
 #from transformers import AdamW, get_linear_schedule_with_warmup
 from typing import List, Union, Callable, Iterable
@@ -14,9 +31,22 @@ import numpy as np
 import os
 import time
 import torch
+from torch.optim import AdamW
 #from torchtext.data.metrics import bleu_score
 from codebleu import calc_codebleu
 from parser_utils import ParserUtils
+from dataclasses import dataclass, field
+
+# if is_sagemaker_mp_enabled():
+#     import smdistributed.modelparallel.torch as smp
+#     from smdistributed.modelparallel import __version__ as SMP_VERSION
+
+#     IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
+
+#     from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
+# else:
+#     IS_SAGEMAKER_MP_POST_1_10 = False
+
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
 os.environ["TOKENIZERS_PARALLELISM"] = 'true'
@@ -90,6 +120,226 @@ SEED = 42
 
 os.environ["WANDB_PROJECT"] = "utg4java_final"
 os.environ["WANDB_LOG_MODEL"] = "end" # end, or checkpoint for log all model checkpoints
+# os.environ["WANDB_MODE"] = "offline" # https://docs.wandb.ai/support/run_wandb_offline/
+# os.environ["WANDB_DISABLED"] = "true"
+
+
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, patience: int = 3, threshold: float = 0.0):
+        self.patience = patience
+        self.threshold = threshold
+        self.best_metric = float("inf")
+        self.early_stop_counter = 0
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, metrics, **kwargs):
+        # Obtener el validation_loss actual
+        # current_metric = state.log_history[-1].get("eval_loss", None)
+
+        metric_to_check = args.metric_for_best_model
+        if not metric_to_check.startswith("eval_"):
+            metric_to_check = f"eval_{metric_to_check}"
+        current_metric = metrics.get(metric_to_check)
+        
+        if current_metric is None:
+            return
+
+        # Verificar si hay mejora (con un margen de "threshold")
+        if current_metric < (self.best_metric - self.threshold):
+            self.best_metric = current_metric
+            self.early_stop_counter = 0  # Reiniciar contador
+        else:
+            self.early_stop_counter += 1
+
+        # Si no hay mejora en "patience" evaluaciones, detener el entrenamiento
+        if self.early_stop_counter >= self.patience:
+            control.should_training_stop = True
+            print(f"⚠️ Early stopping activado: sin mejora en {self.patience} épocas.")
+        else:
+            control.should_training_stop = False
+
+        return control
+
+
+# Layer-wise LR Decay (LLRD): Permitirá que las capas finales (más cercanas a la tarea) se ajusten más rápido,
+# mientras las iniciales (más genéricas) cambien lentamente.
+# Para esto, el layer-wise LR decay asigna un learning rate más bajo a las capas iniciales del modelo (ej: embeddings) 
+# y uno más alto a las capas finales (ej: decodificador).
+# def get_layer_groups(model, weight_decay, decay_parameters: list[str], encoder_base_lr=5e-6, decoder_base_lr=5e-6, encoder_decay_factor=0.95, decoder_decay_factor=1.0):
+def get_layer_groups(model, 
+                     weight_decay, 
+                     decay_parameters: list[str], 
+                     encoder_base_lr=1e-5, 
+                     decoder_base_lr=5e-5, 
+                     encoder_decay_factor=0.95, 
+                     decoder_decay_factor=1.0):
+    """
+    base_lr: Es el leraning_rate inicial
+    encoder_decay_factor: Controla la reducción del LR entre capas (ej: 0.95 reduce un 5% por capa).
+                        Si el LR disminuye demasiado rápido, usar un valor cercano a 1 (e.g., 0.98).
+    decoder_decay_factor: Por defecto es 1.0 para que el decoder tenga más libertad de generar diversas salidas
+    """
+    params = []
+
+    # En CodeT5+ existe model.shared, lo que significa que los embeddings son compartidos
+    # y por tanto debe validarse que se añadan una sola vez. Por eso creamos un set de parámetros únicos
+    added_params = set()
+
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [
+    #             p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+    #         ],
+    #         "weight_decay": self.args.weight_decay,
+    #     },
+    #     {
+    #         "params": [
+    #             p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+    #         ],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
+
+    # - En T5/CodeT5+, cada block representa un bloque completo del Transformer (atención + feed-forward).
+    # - layer se refiere a subcapas dentro de un bloque (e.g., layer.0 es la capa de atención, layer.1 es la feed-forward).
+
+    # Procesar encoder: decaimiento por bloque (0.95)
+    current_lr = encoder_base_lr
+    for block_idx in range(len(model.encoder.block)):
+        # layer = model.encoder.block[block_idx]
+        # params.append({"params": layer.parameters(), "lr": lr})
+        for name, param in model.encoder.block[block_idx].named_parameters():
+            if param in added_params or not param.requires_grad:
+                continue
+            full_name = f"encoder.block.{block_idx}.{name}"
+            # "block.0": Se refiere al primer bloque del encoder/decoder (capa más cercana a los embeddings).
+            # "embed": Incluye los embeddings de entrada (encoder.embed_tokens, decoder.embed_tokens).
+            lr = current_lr * (0.1 if (block_idx == 0 or "embed" in name) else 1.0) # LR bajo para block.0
+            # lr = current_lr * (0.1 if block_idx == 0 else 1.0)  # LR bajo para block.0
+            wd = weight_decay if full_name in decay_parameters else 0.0
+            # params.append({"params": param, "lr": lr})
+            params.append({"params": param, "lr": lr, "weight_decay": wd})
+            # print(f"param_name_add9 encoder.block_{block_idx}.{name} -> LR: {lr} -> WD: {wd}")
+            added_params.add(param)
+        # Se reduce progresivamente el lr en las capas más profundas
+        current_lr *= encoder_decay_factor  # Decaimiento para el siguiente bloque (¡Solo aplica al encoder!)
+
+    # Procesar decoder: sin decaimiento (decoder_decay=1.0)
+    current_lr = decoder_base_lr  # Opcional: Usar mismo current_lr que viene del encoder si se quiere diferenciar
+    for block_idx in range(len(model.decoder.block)):
+        for name, param in model.decoder.block[block_idx].named_parameters():
+            if param in added_params or not param.requires_grad:
+                continue
+            full_name = f"decoder.block.{block_idx}.{name}"
+            lr = current_lr * (0.1 if (block_idx == 0 or "embed" in name) else 1.0)
+            # lr = current_lr * (0.1 if block_idx == 0 else 1.0)
+            wd = weight_decay if full_name in decay_parameters else 0.0
+            # params.append({"params": param, "lr": lr})
+            params.append({"params": param, "lr": lr, "weight_decay": wd})
+            # print(f"param_name_add9 decoder.block_{block_idx}.{name} -> LR: {lr} -> WD: {wd}")
+            added_params.add(param)
+        current_lr *= decoder_decay_factor  # No reduce el LR (1.0 = sin decaimiento)
+    
+    
+    # Añadir embeddings y lm_head
+    for name, param in model.lm_head.named_parameters(): # Capa de salida
+        # print(f"model_lm_head_param: {name}")
+        if param not in added_params and param.requires_grad:
+            wd = weight_decay if name in decay_parameters else 0.0
+            # params.append({"params": param, "lr": decoder_base_lr})
+            params.append({"params": param, "lr": decoder_base_lr, "weight_decay": wd})
+            # print(f"param_lm_head_name_add9: {name} -> LR: {decoder_base_lr} -> WD: {wd}")
+            added_params.add(param)
+    
+    # Añadir parámetros restantes (no incluidos en encoder/decoder) (embeddings, lm_head, etc.)
+    for name, param in model.named_parameters():
+        if param not in added_params and param.requires_grad:
+            if "embed" in name:
+                lr = encoder_base_lr * 0.1
+            else:
+                lr = decoder_base_lr
+            # lr = base_lr * (0.1 if "embed" in name else 1.0)
+            wd = weight_decay if name in decay_parameters else 0.0
+            # params.append({"params": param, "lr": lr})
+            params.append({"params": param, "lr": lr, "weight_decay": wd})  # LR por defecto
+            # print(f"param_rest_model_name_add9: {name} -> LR: {lr} -> WD: {wd}")
+            added_params.add(param)
+
+    return params
+
+
+class CustomTrainer(Seq2SeqTrainer):
+    def log(self, logs: dict) -> None:
+        # Obtener los LRs de todos los grupos de parámetros
+        lrs = [group["lr"] for group in self.optimizer.param_groups]
+
+        # Añadir al log los LRs máximos, mínimos y promedio
+        logs["lr_max"] = max(lrs)
+        logs["lr_min"] = min(lrs)
+        logs["lr_mean"] = sum(lrs) / len(lrs)
+
+        # # Opcional: Registrar todos los LRs individualmente
+        # for i, lr in enumerate(lrs):
+        #     logs[f"lr_group_{i}"] = lr
+
+        # Llamar al método original de logging
+        super().log(logs)
+    
+
+    # Sobreescribe el optimizador de la clase Trainer para usar Layer-wise LR Decay
+    def create_optimizer(self):
+        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        decay_parameters = self.get_decay_parameter_names(opt_model)
+
+        # Obtener parámetros del optimizador desde TrainingArguments
+        opt_cls, opt_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+
+        # Crear grupos de parámetros personalizados
+        # param_groups = get_layer_groups(opt_model, self.args.weight_decay, decay_parameters)
+        param_groups = get_layer_groups(
+            opt_model, 
+            self.args.weight_decay, 
+            decay_parameters, 
+            encoder_base_lr=self.args.encoder_learning_rate, 
+            decoder_base_lr=self.args.decoder_learning_rate, 
+            encoder_decay_factor=self.args.encoder_decay_factor, 
+            decoder_decay_factor=self.args.decoder_decay_factor
+        )
+
+        # Inicializar optimizador con los grupos y parámetros estándar
+        self.optimizer = opt_cls(param_groups, **opt_kwargs)
+
+        # print(decay_parameters)
+        # print(f"\n\ndecay_parameters {len(decay_parameters)}")
+        # print(f"\nparam_groups {len(param_groups)}")
+
+        # if is_sagemaker_mp_enabled():
+        #     self.optimizer = smp.DistributedOptimizer(self.optimizer)
+        
+        return self.optimizer
+
+
+@dataclass
+# @add_start_docstrings(Seq2SeqTrainingArguments.__doc__)
+class CustomTrainingArguments(Seq2SeqTrainingArguments):
+    encoder_learning_rate: float = field(default=1e-5, metadata={"help": "The initial encoder learning rate for AdamW."})
+    # Para fp16: Si los tests generados son muy genéricos, aumenta decoder_base_lr=7e-5
+    decoder_learning_rate: float = field(default=5e-5, metadata={"help": "The initial decoder learning rate for AdamW."})
+    # Si el encoder no aprende (ej: eval_loss no disminuye), reduce el decaimiento a 0.98
+    encoder_decay_factor: float = field(default=0.95, metadata={"help": "The decay_factor that reduces the LR in encoder layers."})
+    decoder_decay_factor: float = field(default=1.0, metadata={"help": "The decay_factor that reduces the LR in decoder layers."})
+
+    def to_dict(self):
+        """
+        Serializes this instance while replace `Enum` by their values and `GenerationConfig` by dictionaries (for JSON
+        serialization support). It obfuscates the token values by removing their value.
+        """
+        # filter out fields that are defined as field(init=False)
+        d = super().to_dict()
+        for k, v in d.items():
+            if isinstance(v, GenerationConfig):
+                d[k] = v.to_dict()
+        return d
+
 
 
 # Utilities to Clean memory
@@ -398,7 +648,8 @@ def calculate_bleu_metrics(index: int, list_predictions: list, list_targets: lis
     print(f"\n\n\nMétricas BLEU Nro {index}:\nBleu = {bleu_value}\nCode_bleu = {codebleu_value}\n\n\n")
 
     print(f"\nSaving Predictions File Nro {index}...")
-    output_predicts_path = outputPath + os.path.sep + "test_" + tagModel + "_finetuning_predicts_" + str(index) + ".txt"
+    # output_predicts_path = outputPath + os.path.sep + "test_" + tagModel + "_finetuning_predicts_" + str(index) + ".txt"
+    output_predicts_path = os.path.join(outputPath, "test_" + tagModel + "_finetuning_predicts_" + str(index) + ".txt")
     save_in_file_list_lines(output_predicts_path, list_predictions, "Saving predictions in file Nro " + str(index))
 
     # Aqui no guardamos los targest, ya que estos no cambian y se guardan desde donde se llama este método
@@ -553,7 +804,8 @@ def test_predicts(tokenizer, decoder_start_token_id, trainer: Seq2SeqTrainer, te
     trainer.save_metrics("test", test_outputs.metrics)
     
     print("\nSaving Targets File...")
-    output_targets_path = outputPath + os.path.sep + "test_" + tagModel + "_finetuning_targets.txt"
+    # output_targets_path = outputPath + os.path.sep + "test_" + tagModel + "_finetuning_targets.txt"
+    output_targets_path = os.path.join(outputPath, "test_" + tagModel + "_finetuning_targets.txt")
     save_in_file_list_lines(output_targets_path, list_targets, "Saving targets in file")
 
     return list_bleu, list_codebleu, corrects_by_pos_before_changes, corrects_by_pos_after_changes, predictions_with_error_in_all_beams
@@ -598,13 +850,19 @@ if __name__ == '__main__':
     print(f"Device: {device}  |  Accelerator: {accelerator}")
 
     if useFp16 and useBf16:
-        raise "Debe indicar un solo tipo de precision: fp16 o bf16"
+        raise "Debe indicar un solo tipo de precision: fp16 o bf16. Si no indica ninguno, por defecto será fp32"
     
     half_precision_backend = "auto" # por defecto
     if useBf16:
         half_precision_backend = "cpu_amp" # bf16 solo se puede ejecutar sobre CPU o sobre NVIDIA con arquitectura AMP o superior
 
-    print(f"Precision: useFp16={useFp16}, useBf16={useBf16}  |  Half Precision Backend: {half_precision_backend}")
+    precision = "fp32"
+    if useFp16:
+        precision = "fp16"
+    elif useBf16:
+        precision = "bf16"
+
+    print(f"Precision: {precision}  |  Half Precision Backend: {half_precision_backend}")
 
 
     if tagModel == "utg4java":
@@ -627,7 +885,7 @@ if __name__ == '__main__':
         cache_dir=cacheDirHuggingFace, 
         additional_special_tokens=special_tokens
     )
-    tokenizer.model_max_length = 1024
+    # tokenizer.model_max_length = 1024
     print("Type tokenizer: " + str(type(tokenizer)))
     print("Length tokenizer: " + str(len(tokenizer)))
 
@@ -656,6 +914,12 @@ if __name__ == '__main__':
     #print(train_valid_test_dataset["valid"][0])
 
     config.n_positions = tokenizer.model_max_length
+    # Ajustar dropout en atención y capas ocultas
+    # Un dropout mas alto (0.2) es util en datasets de entrenamientos pequeños para evitar el sobreajuste
+    config.dropout_rate = 0.2  # Dropout general (si existe): # Valor típico para regularización: 0.2
+    # config.attention_probs_dropout_prob = 0.2  # Dropout en capa de atención -> encoder.attn_pdrop=0.0 para CodeT5+ >= 2b
+    # config.hidden_dropout_prob = 0.2  # Dropout en capas ocultas             -> decoder.attn_pdrop=0.0 para CodeT5+ >= 2b
+
     max_seq_length = config.n_positions # max_position_embeddings
     print("Max seq length: " + str(max_seq_length))
 
@@ -689,6 +953,10 @@ if __name__ == '__main__':
         model = T5ForConditionalGeneration.from_pretrained(model_base, config=config, cache_dir=cacheDirHuggingFace)
         #model = AutoModelForSeq2SeqLM.from_pretrained(model_base, config=config, cache_dir=cacheDirHuggingFace)
         model.resize_token_embeddings(len(tokenizer))
+        # model.encoder
+        # model.decoder
+        # model.shared
+        # model.gradient_checkpointing_enable()  # ¡Clave aquí si se requiere usar gradient_checkpointing!
         model.to(device)
     else:
         assert inputModel is not None, "If doTrain is False you must indicate an input model"
@@ -708,40 +976,71 @@ if __name__ == '__main__':
     print(f" - Model Disk Size: {model_disk_size}")
     print(f" - Model Disk Size Formatted: {model_disk_size_formatted}")
 
-    output_configs_path = outputPath + os.path.sep + tagModel + "_finetuning_modelconfigs.txt"
+    # output_configs_path = outputPath + os.path.sep + tagModel + "_finetuning_modelconfigs.txt"
+    output_configs_path = os.path.join(outputPath, tagModel + "_finetuning_modelconfigs.txt")
     save_in_file_one_line(output_configs_path, str(model.config))
 
     print("\nShowing memory after load model...")
     show_cache()
 
+    # optimizer = AdamW(get_layer_groups(model), lr=5e-6, weight_decay=0.03)
+    # Imprimir grupos de parámetros y sus LRs
+    # for group in optimizer.param_groups:
+    #     print(f"LR: {group['lr']:.2e}, Parámetros: {len(group['params'])}")
 
-    #assert 128 == max_seq_length, "Return"
+    # assert 128 == max_seq_length, "Return"
 
     # Solamente necesitamos que el DataCollator convierta los inputs a tensores
     data_collator = DefaultDataCollator(
         return_tensors="pt"
     )
 
-    # CodeT5 para fine-tuning usa lr=5e-5
+    # CodeT5 para fine-tuning (Seq2Seq) usa lr=5e-5
     # CodeT5+ para fine-tuning (Code summarization) usa lr=2e-5, epochs=10, batch_size=64, beam_size=5
 
-    learning_rate_finetuning = 2e-5
-    #learning_rate_finetuning = 1e-5
+    optimizer = "adamw_torch"
+    # learning_rate_finetuning = 2e-5
+    learning_rate_finetuning = 1e-5
+    # learning_rate_finetuning = 5e-6 # Reducción adicional: Mantener esta para el dataset completo
+    # learning_rate_finetuning = 3e-6 # Se reduce ligeramente para un ajuste más fino en etapas tardías.
     gradient_accumulation_steps = gradientAccumuSteps
     weight_decay = 0.05 # This is the recommended in source_code in CodeT5+
+    # weight_decay = 0.01
+    # weight_decay = 0.03             # Balance entre regularización y aprendizaje   # Con Layer-wise LR decay para permitir más flexibilidad en el aprendizaje.
+    # weight_decay = 0.02
     #weight_decay = 0.001
-    lr_scheduler_type = "linear" # transformers.SchedulerType
+    # lr_scheduler_type = "linear" # transformers.SchedulerType
+    # lr_scheduler_type = "cosine"
+    lr_scheduler_type = "cosine_with_restarts" # Ayuda a escapar mínimos locales
+    lr_scheduler_kwargs = {'num_cycles': 2} # Número de reinicios del scheduler
+    # lr_scheduler_kwargs = {'num_cycles': 3} # Esto daría un reinicio adicional del learning rate
+    max_grad_norm = 0.5             # Clipping más estricto
+    # max_grad_norm = 1.0                # Para fp16
 
     effective_batch_size = batchSizeTrain * gradient_accumulation_steps
-    num_train_steps = (len(tokenized_datasets["train"]) // effective_batch_size) * epochs
+    steps_by_epoch = (len(tokenized_datasets["train"]) // effective_batch_size)
+    num_train_steps = steps_by_epoch * epochs
+    # gradient_checkpointing = True if (useFp16 or useBf16) else False
 
     warmup_ratio = lrWarmupRatio if lrWarmupRatio is not None else 0.05
     warmup_steps = lrWarmupSteps if lrWarmupSteps is not None else int(num_train_steps * warmup_ratio)
 
-    print(f"\nNum_train_steps={num_train_steps}, warmup_ratio={warmup_ratio}, warmup_steps={warmup_steps}\n")
+    warmup_ratio_percent = warmup_ratio * 100
+
+    print(f"\nCalculated Num_train_steps={num_train_steps}, warmup_ratio={warmup_ratio} ({warmup_ratio_percent}%), warmup_steps={warmup_steps}\n")
+    path_logging_dir = os.path.join(outputPath, "logs")
 
     # https://github.com/salesforce/CodeT5/blob/main/CodeT5%2B/tune_codet5p_seq2seq.py
     training_args = Seq2SeqTrainingArguments(
+    # training_args = CustomTrainingArguments(
+        # custom attributes
+        # encoder_learning_rate = 3e-5,
+        # decoder_learning_rate = 7e-5, # Si los tests generados son muy genéricos, aumentar decoder_base_lr=7e-5 - 6e-5
+        # encoder_decay_factor = 0.95,  # Si el encoder no aprende (ej: eval_loss no disminuye), reducir el decaimiento a 0.98
+        # decoder_decay_factor = 0.98,
+
+        # debug="underflow_overflow", # Para monitorear si hay inestabilidad (loss=NaN o fluctuaciones bruscas) # This delay the training
+
         use_cpu=accelerator == "cpu",
         output_dir=outputPath,
         overwrite_output_dir=True,
@@ -755,27 +1054,32 @@ if __name__ == '__main__':
 
         # trainings parameters
         num_train_epochs=epochs,
-        #max_steps=50,
+        # max_steps=10,
         per_device_train_batch_size=batchSizeTrain,
         per_device_eval_batch_size=batchSizeValidation,
 
         # optimization parameters
-        optim="adamw_torch",
+        optim=optimizer,
         learning_rate=learning_rate_finetuning,
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=gradient_accumulation_steps, # Ayuda a estabilizar los gradientes
         weight_decay=weight_decay,
         lr_scheduler_type=lr_scheduler_type,
-        warmup_steps=warmup_steps,
-        fp16=useFp16,
+        lr_scheduler_kwargs=lr_scheduler_kwargs,
+        #warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
+        max_grad_norm=max_grad_norm,
+        fp16=useFp16, # fp16=False es equivalente a FP32 (es decir, desactiva mixed-precision)
         bf16=useBf16,
         half_precision_backend=half_precision_backend,
+        # gradient_checkpointing=gradient_checkpointing, # Para acelerar la velocidad de entrenamiento con fp16. Con fp32 reduce uso de memoria pero tambien reduce la velocidad entre un 25 y 30%
         #fp16_full_eval=True, Más rápido, pero puede afectar las métricas
         #bf16_full_eval=True, Estas opciones lo que hacen es setear el tipo de dato del modelo en precisión mixta
 
         # logging strategies
         disable_tqdm=False,
         log_level="info", # default: passive
-        logging_dir=f"{outputPath}/logs",
+        # logging_dir=f"{outputPath}/logs",
+        logging_dir=path_logging_dir,
         logging_strategy="steps",
         logging_steps=loggerFrequencySteps,
         #logging_nan_inf_filter=True,
@@ -784,12 +1088,12 @@ if __name__ == '__main__':
         #skip_memory_metrics=False,
 
         # evaluation and saving strategies
-        save_total_limit=1, # 2
+        save_total_limit=2, # 2
         save_strategy="epoch", # steps, no
         #save_steps=save_steps,
         evaluation_strategy="epoch", # steps
         #eval_steps=eval_steps,
-        load_best_model_at_end=False, # save_strategy and evaluation_strategy should be same
+        load_best_model_at_end=True, # save_strategy and evaluation_strategy should be same
         metric_for_best_model="eval_loss",
         greater_is_better=False, # For loss then False, for accuracy then True
         #save_only_model=True, You can only load the model using `from_pretrained`
@@ -802,15 +1106,76 @@ if __name__ == '__main__':
 
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
+    # trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets["train"],
+        # train_dataset=tokenized_datasets["train"].select(range(45_056)),
+        # train_dataset=tokenized_datasets["train"].select(range(51_200)),
+        # train_dataset=tokenized_datasets["train"].shuffle(seed=SEED).select(range(62_976)),
+        # train_dataset=tokenized_datasets["train"].select(range(62_976)),
         eval_dataset=tokenized_datasets["valid"],
+        # eval_dataset=tokenized_datasets["valid"].select(range(5_120)),
+        # eval_dataset=tokenized_datasets["valid"].select(range(6_400)),
+        # eval_dataset=tokenized_datasets["valid"].select(range(128)),
         tokenizer=tokenizer,
         data_collator=data_collator,
         #compute_metrics=compute_metrics
         #callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+        callbacks=[EarlyStoppingCallback(patience=4)]  # Paciencia de 3 épocas para datasets pequeños, 5 para más grandes
+        # callbacks=[EarlyStoppingCallback(patience=3, threshold=0.002)]
     )
+
+    # # Valida si el optimizador tiene parámetros
+    # optimizer = trainer.create_optimizer()
+    # def format_number(number):
+    #     return f"{number:.2e}"
+    # formatter = "LR: {} -> len_params: {}"
+    # print(f"Numero de grupos de parametros: {len(optimizer.param_groups)}")
+    # # print(f"Parámetros por grupo: {[len(g['params']) for g in optimizer.param_groups]}")
+    # # print(f"Parametros por grupo: {[formatter.format(format_number(g['lr']), str(len(g['params']))) for g in optimizer.param_groups]}")
+    # print(f"Parámetros por grupo: {[format_number(g['lr']) for g in optimizer.param_groups]}")
+
+    # Valida que los LR que se usarán son correctos
+    # prueba_total_steps = 4920 # 25 epochs: 4400, 20 epochs: 
+    # trainer.create_optimizer_and_scheduler(num_training_steps=prueba_total_steps)
+    # optimizer = trainer.optimizer
+    # lr_scheduler = trainer.lr_scheduler
+    # list_res_lr = []
+    # step = 0
+    # log_step = 0
+    # steps_by_epoch = prueba_total_steps // epochs
+    # for i in range(prueba_total_steps):
+    #     step += 1
+
+    #     lr_scheduler.step()
+    #     # if not (step % gradient_accumulation_steps == 0):
+    #     # if not (step % steps_by_epoch == 0):
+    #     #     lr_scheduler.step()
+        
+    #     if not (step % loggerFrequencySteps == 0):
+    #         if (step % steps_by_epoch == 0):
+    #             log_step += 1
+    #         continue
+
+    #     last_lr = lr_scheduler.get_last_lr()
+    #     # last_lr = lr_scheduler.get_last_lr()[0]
+    #     # if torch.is_tensor(last_lr):
+    #     #     last_lr = last_lr.item()
+        
+    #     list_res_lr.append(f"Step {step} ({log_step}):   LR -> {last_lr}")
+    #     log_step += 1
+
+    #     if (step % steps_by_epoch == 0):
+    #         log_step += 1
+
+    # print("\nSaving LR results File...")
+    # output_results_lr = os.path.join("/root", tagModel + "_lr_results_5.txt")
+    # save_in_file_list_lines(output_results_lr, list_res_lr, "Saving lr results in file")
+    # print("\n\n")
+
+    # assert 128 == max_seq_length, "Return"
+
     trainer.create_model_card()
 
 
@@ -834,19 +1199,35 @@ if __name__ == '__main__':
         #trainer.save_metrics("eval", eval_results)
 
         results.append("SUMMARY MODEL:\n")
+        results.append(f"Pretrain Model Base: {model_base}")
         results.append(f"Model Params Size: {model_params_size}")
         results.append(f"Model Params Size Formatted: {model_params_size_formatted}")
         results.append(f"Model Disk Size: {model_disk_size}")
         results.append(f"Model Disk Size Formatted: {model_disk_size_formatted}")
         results.append("\n")
 
-        results.append("TRAINING AND VALIDATION RESULTS:\n")
+        results.append("OPTIMIZATION AND TRAINING PARAMETERS:\n")
+        results.append(f"Optimizer: {optimizer}")
+        results.append(f"Lr scheduler type: {lr_scheduler_type}")
+        results.append(f"Learning rate: {learning_rate_finetuning}")
+        results.append(f"Weight decay: {weight_decay}")
+        results.append(f"Warmup ratio: {warmup_ratio} -> {warmup_ratio_percent}%")
+        results.append(f"Warmup steps: {warmup_steps}")
+        results.append(f"Max grad norm: {max_grad_norm}")
+        results.append(f"Dropout rate: {config.dropout_rate}")
         results.append(f"Training batch size: {batchSizeTrain}")
         results.append(f"Validation batch size: {batchSizeValidation}")
+        results.append(f"Gradient accumulation steps: {gradientAccumuSteps}")
+        results.append(f"Effective batch size (Training): {effective_batch_size}")
         results.append(f"Total expected epochs: {epochs}")
+        results.append(f"Precision: {precision}")
+        results.append("\n")
+
+        results.append("TRAINING AND VALIDATION RESULTS:\n")
         results.append(f"Total expected trainig steps: {trainer.state.max_steps}")
         results.append(f"Total expected trainig steps (calculated): {num_train_steps}")
         results.append(f"Total trained epochs: {trainer.state.epoch}")
+        results.append(f"Steps by epoch: {steps_by_epoch}")
         results.append(f"Total trained steps: {trainer.state.global_step}")
         results.append(f"Elapsed time: {elapsed_time_train_and_val} seconds")
         results.append(f"Elapsed time (formatted): {elapsed_time_train_and_val_formatted}")
@@ -867,11 +1248,13 @@ if __name__ == '__main__':
         results.append(str(summary_tokenized_dataset))
         results.append("")
 
-        output_results_path = outputPath + os.path.sep + tagModel + "_finetuning_train_results.txt"
+        # output_results_path = outputPath + os.path.sep + tagModel + "_finetuning_train_summary.txt"
+        output_results_path = os.path.join(outputPath, tagModel + "_finetuning_train_summary.txt")
         print("\nSaving Results File...")
-        save_in_file_list_lines(output_results_path, results, "Saving results in file")
+        save_in_file_list_lines(output_results_path, results, "Saving summary in file")
 
-        output_log_history_path = outputPath + os.path.sep + tagModel + "_finetuning_log_history.txt"
+        # output_log_history_path = outputPath + os.path.sep + tagModel + "_finetuning_log_history.txt"
+        output_log_history_path = os.path.join(outputPath, tagModel + "_finetuning_log_history.txt")
         print("Saving Log History...")
         save_list_dicts_in_file_as_a_json(output_log_history_path, trainer.state.log_history, "Saving log history in file")
 
@@ -887,9 +1270,9 @@ if __name__ == '__main__':
         bleu_metrics = []
         print("\nInit Testing Predictions...")
         start_time_test = time.time()
-        #partial_test_dataset = tokenized_datasets["test"].select(range(10))
-        #partial_test_dataset = tokenized_datasets["test"].select(range(128))
-        partial_test_dataset = tokenized_datasets["test"].select(range(1024))
+        # partial_test_dataset = tokenized_datasets["test"].select(range(64))
+        # partial_test_dataset = tokenized_datasets["test"].shuffle(seed=SEED).select(range(128))
+        partial_test_dataset = tokenized_datasets["test"].shuffle(seed=SEED).select(range(2_048))
         #partial_test_dataset = tokenized_datasets["test"].select(range(3_200))
         #partial_test_dataset = tokenized_datasets["test"]
         list_bleu, list_codebleu, corrects_by_pos_before_changes, corrects_by_pos_after_changes, predictions_with_error_in_all_beams = test_predicts(
@@ -919,7 +1302,8 @@ if __name__ == '__main__':
         bleu_metrics.append(f"corrects_by_pos_beam_after_changes: {str(corrects_by_pos_after_changes)}")
         bleu_metrics.append(f"predictions_with_error_in_all_beams: {str(predictions_with_error_in_all_beams)}")
 
-        output_bleu_metrics = outputPath + os.path.sep + tagModel + "_finetuning_bleu_metrics.txt"
+        # output_bleu_metrics = outputPath + os.path.sep + tagModel + "_finetuning_bleu_metrics.txt"
+        output_bleu_metrics = os.path.join(outputPath, tagModel + "_finetuning_bleu_metrics.txt")
         print("\nSaving Bleu Metrics Results File...")
         save_in_file_list_lines(output_bleu_metrics, bleu_metrics, "Saving bleu metrics results in file")
 

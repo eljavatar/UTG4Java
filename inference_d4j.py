@@ -2,16 +2,20 @@ from argparse import ArgumentParser
 from datasets import load_dataset, DatasetDict, Dataset, IterableDatasetDict, IterableDataset
 from distutils.util import strtobool
 from parser_utils import ParserUtils
-from transformers import AutoTokenizer, T5ForConditionalGeneration, T5Config, PLBartTokenizer, PLBartForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments, DefaultDataCollator, DataCollatorForSeq2Seq, EvalPrediction
+from transformers import AutoTokenizer, T5ForConditionalGeneration, T5Config, PLBartTokenizer, PLBartForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments, DefaultDataCollator, DataCollatorForSeq2Seq, EvalPrediction, PreTrainedModel
+# from transformers.trainer_pt_utils import DistributedTensorGatherer
 from tqdm import tqdm
 from typing import List, Union, Callable, Iterable
 import csv
 import datetime
 import gc
+import math
 import numpy as np
 import os
 import time
 import torch
+from torch import nn
+from torch.utils.data import DataLoader
 
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
 os.environ["TOKENIZERS_PARALLELISM"] = 'true'
@@ -58,8 +62,10 @@ defects4jInputs = args.defects4jInputs
 NUM_CPUS = os.cpu_count() // 2
 SEED = 42
 
-DF4_PROJECTS = ["Lang", "Chart", "Cli", "Csv", "Gson"]
+DF4_PROJECTS = ['Closure', 'Cli', 'Codec', 'Collections', 'Compress', 'Csv', 'JxPath', 'Lang', 'Math', 'Gson', 'JacksonCore', 'JacksonDatabind', 'JacksonXml', 'Chart', 'Time', 'Jsoup', 'Mockito']
+#DF4_PROJECTS = ["Lang", "Chart", "Cli", "Csv", "Gson"]
 #DF4_PROJECTS = ["Gson", "Csv"]
+#DF4_PROJECTS = ["Time"]
 #DF4_PROJECTS = ["Gson"]
 
 listPredictions: dict[dict] = {}
@@ -153,12 +159,42 @@ def secs2timedelta(secs):
     return f"{datetime.timedelta(seconds=int(secs))}.{msec:02d}"
 
 
+def speed_metrics(split, start_time, num_samples=None, num_steps=None, num_tokens=None):
+    """
+    Measure and return speed performance metrics.
+
+    This function requires a time snapshot `start_time` before the operation to be measured starts and this function
+    should be run immediately after the operation to be measured has completed.
+
+    Args:
+    - split: name to prefix metric (like train, eval, test...)
+    - start_time: operation start time
+    - num_samples: number of samples processed
+    - num_steps: number of steps processed
+    - num_tokens: number of tokens processed
+    """
+    runtime = time.time() - start_time
+    result = {f"{split}_runtime": round(runtime, 4)}
+    if runtime == 0:
+        return result
+    if num_samples is not None:
+        samples_per_second = num_samples / runtime
+        result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
+    if num_steps is not None:
+        steps_per_second = num_steps / runtime
+        result[f"{split}_steps_per_second"] = round(steps_per_second, 3)
+    if num_tokens is not None:
+        tokens_per_second = num_tokens / runtime
+        result[f"{split}_tokens_per_second"] = round(tokens_per_second, 3)
+    return result
+
+
 def save_prediction_results_in_csv(project_name: str, path_results: str, prediction_results: dict[list]):
     path_file_prediction_results = os.path.join(path_results, project_name + "_generated_tests.csv")
     columns_names = list(prediction_results.keys())
     #rows = zip(*prediction_results.values())
     rows = list(zip(*prediction_results.values()))
-    with open(path_file_prediction_results, 'w', newline='') as csvfile:
+    with open(path_file_prediction_results, 'w', newline='', encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         # Escribimos los nombres de las columnas
         writer.writerow(columns_names)
@@ -195,9 +231,9 @@ def postProcessingA3Test(line):
 
     #append test if not
     if "void" in words:
-        id =  words.index("void")
-        if(words[id+1][:4]!="test"):
-            words[id+1] = "test"+words[id+1]
+        id = words.index("void")
+        if(words[id+1][:4] != "test"):
+            words[id+1] = "test" + words[id+1]
 
     status = checkA3Test(line)
     if(status=="Unbalanced"):
@@ -298,12 +334,56 @@ def generate_predictions(tokenizer,
                          d4j_dataset: Dataset, 
                          generation_strategy: str, 
                          num_return_sequences: int):
+    """
+    Sampling
+    Características
+    - Diversidad: Genera texto estocásticamente, seleccionando tokens basándose en su probabilidad. Esto puede producir salidas más creativas y variadas.
+    - Riesgo de incoherencia: Mayor probabilidad de generar código sintácticamente incorrecto o menos relevante.
+    - Recomendado para escenarios donde quieres explorar múltiples soluciones alternativas.
+    Parámetros clave:
+    - temperature: Valores bajos (ej. 0.3) generan texto más seguro pero menos diverso.
+    - top_k/top_p: Limitan la selección de tokens para evitar opciones absurdas.
+
+    Beam Search
+    Características:
+    - Coherencia: Mantiene múltiples secuencias candidato (beams) y selecciona las de mayor probabilidad acumulada. Ideal para generar código preciso y estructurado.
+    - Menos diversidad: Tiende a converger en secuencias similares, especialmente con pocos beams.
+    - Recomendado cuando la precisión sintáctica y lógica es crítica (ej. código Java válido).
+    Parámetros clave:
+    - num_beams: Usa valores entre 4 y 10 para equilibrio calidad/velocidad.
+    - length_penalty: Ajusta para evitar salidas truncadas o redundantes.
+
+    ¿Cuál estrategia usar?
+
+    Beam Search es preferible para:
+    - Generar código que debe compilar (ej. métodos bien estructurados).
+    - Casos de prueba con requisitos específicos (ej. manejo de excepciones).
+
+    Sampling es útil para:
+    - Explorar múltiples enfoques (ej. diferentes assertions o escenarios).
+    - Evitar la redundancia en casos de prueba repetitivos.
+
+    En resumen, si se prioriza correctitud, usar beam search. Si se necesita diversidad, optar por sampling con parámetros conservadores (top_p=0.9, temperature=0.5)
+
+    También se puede usar un enfoque híbrido si el modelo lo soporta:
+    outputs = model.generate(
+        inputs.input_ids,
+        max_length=200,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        num_beams=3,  # Combina beams con muestreo
+        early_stopping=True,
+    )
+    """
+    
     if generation_strategy == "greddy_search":
         predict_outputs = trainer.predict(
             test_dataset=d4j_dataset, 
             metric_key_prefix=project_name,
             eos_token_id=tokenizer.eos_token_id,
             #decoder_start_token_id = decoder_start_token_id,
+            do_sample=False,
             max_length=max_length
         ) # PredictionOutput
     
@@ -312,24 +392,72 @@ def generate_predictions(tokenizer,
             test_dataset=d4j_dataset, 
             metric_key_prefix=project_name, 
             eos_token_id=tokenizer.eos_token_id,
-            #decoder_start_token_id = decoder_start_token_id,
-            do_sample=False,
-            num_beams=numBeamsPredictions,
             max_length=max_length,
-            #no_repeat_ngram_size=2,
-            early_stopping=True,
-            num_return_sequences=num_return_sequences
+            decoder_start_token_id = decoder_start_token_id,
+            do_sample=False,
+            num_beams=numBeamsPredictions,   # Número de beams (más beams = mejor calidad, pero más lento)
+            #length_penalty=0.8,             # Penaliza secuencias largas (valores < 1 acortan las salidas). Se ajusta para evitar salidas truncadas o redundantes
+            early_stopping=True,            # Detiene la generación si todos los beams convergen
+            num_return_sequences=num_return_sequences # Devuelve los mejores [num_return_sequences] beams
+            # Para obtener las probabilidades se agregarían los siguientes parámetros:
+            #output_scores=True,  # Habilitar el cálculo de las probabilidades
+            #return_dict_in_generate=True,  # Devolver un diccionario con los resultados
         )
+        # Para obtener las secuencias generadas y sus probabilidades, se haría de la siguiente forma:
+        # sequences = output.sequences
+        # scores = output.sequences_scores  # Probabilidades logarítmicas de cada secuencia
+        # Se convierten las secuencias de nuevo a texto:
+        # generated_texts = [tokenizer.decode(seq, skip_special_tokens=True) for seq in sequences]
+        # Se encuentra la secuencia con la probabilidad más alta:
+        # best_index = scores.argmax().item()
+        # best_sequence = generated_texts[best_index]
+        # best_score = scores[best_index].exp().item()  # Convertir de log-prob a probabilidad
+        # print(f"Secuencia con la probabilidad más alta: {best_sequence}")
+        # print(f"Probabilidad: {best_score}")
+
+        # Explicación:
+        # - num_beams: Define el número de beams (haces) que se utilizarán en la búsqueda.
+        # - num_return_sequences: Especifica cuántas secuencias quieres que se devuelvan.
+        # - output_scores: Habilita el cálculo de las probabilidades logarítmicas de cada secuencia.
+        # - return_dict_in_generate: Devuelve un diccionario con las secuencias y sus puntuaciones.
+        # - scores: Contiene las probabilidades logarítmicas de cada secuencia. Puedes convertirlas a probabilidades usando .exp().
+
+        # Nota:
+        # - Las probabilidades devueltas son log-probabilidades, por lo que debes aplicar exp() para convertirlas a probabilidades normales.
+        # - La secuencia con la probabilidad más alta es aquella cuyo score es el mayor.
+
+        # Para obtener todas las secuencias ordenadas según la probabilidad más alta, se haría de la siguiente forma:
+        # Acceder a las secuencias generadas y sus probabilidades
+        # sequences = output.sequences
+        # scores = output.sequences_scores  # Log-probabilidades de cada secuencia
+
+        # # Convertir las secuencias de nuevo a texto
+        # generated_texts = [tokenizer.decode(seq, skip_special_tokens=True) for seq in sequences]
+
+        # # Combinar las secuencias con sus probabilidades
+        # sequence_prob_pairs = list(zip(generated_texts, scores))
+
+        # # Ordenar las secuencias según su probabilidad (de mayor a menor)
+        # sorted_sequence_prob_pairs = sorted(sequence_prob_pairs, key=lambda x: x[1], reverse=True)
+
+        # # Mostrar las secuencias ordenadas
+        # for i, (seq, log_prob) in enumerate(sorted_sequence_prob_pairs):
+        #     prob = log_prob.exp().item()  # Convertir log-prob a probabilidad
+        #     print(f"Secuencia {i + 1}: {seq}")
+        #     print(f"Probabilidad: {prob}\n")
 
     elif generation_strategy == "sampling":
+        # https://github.com/salesforce/CodeT5/blob/main/CodeT5%2B/humaneval/generate_codet5p.py#L122
         predict_outputs = trainer.predict(
             test_dataset=d4j_dataset, 
             metric_key_prefix=project_name, 
             eos_token_id=tokenizer.eos_token_id,
             decoder_start_token_id = decoder_start_token_id,
-            do_sample=True, 
-            top_k=0,
-            temperature=0.8
+            do_sample=True,  # # Habilita el muestreo
+            temperature=0.8, # Controla la aleatoriedad (0.1-1.0: valores bajos = más determinista)
+            top_k=50,        # Filtra los 50 tokens más probables en cada paso
+            top_p=0.95,      # Muestreo de núcleo (nucleus sampling): acumula hasta el 95% de probabilid
+            num_return_sequences=num_return_sequences  # Generar múltiples opciones para comparar
         )
     
     elif generation_strategy == "top_k_sampling":
@@ -359,7 +487,212 @@ def generate_predictions(tokenizer,
             num_return_sequences=num_return_sequences
         )
 
+        # Otra estrategia puede ser beam_group_search.
+        # Sería similar a beam_search, pero agregando los siguientes parámetros:
+        # - num_beam_groups: Cantidad de grupos de beams
+        # - diversity_penalty: Controla la similitud en cada grupo de salidas
+        # Esto podría llegar a ser útil, si por ejemplo se quieren generar diversos
+        # métodos de test que validen diversos casos de uso (branches) que se dan en un método focal
+        # https://huggingface.co/docs/transformers/generation_strategies
+
     return predict_outputs
+
+
+
+def sorted_by_score_d4j_predicts(trainer: Seq2SeqTrainer, 
+                                 # model: Union[PreTrainedModel, nn.Module], 
+                                 tokenizer, 
+                                 d4j_dataset: Dataset, 
+                                 project_name: str, 
+                                 max_length: int, 
+                                 num_beams: int, 
+                                 num_return_sequences: int):
+    # Tokenizar el batch de entradas
+    d4j_dataloader: DataLoader = trainer.get_test_dataloader(d4j_dataset)
+    start_time = time.time()
+
+    # batch_size = d4j_dataloader.batch_size
+    batch_size = trainer.args.eval_batch_size
+    num_examples = trainer.num_examples(d4j_dataloader)
+    total_batch_size = trainer.args.eval_batch_size * trainer.args.world_size
+    num_steps = math.ceil(num_examples / total_batch_size)
+
+    print(f"***** Running predictions for {project_name} *****")
+    print(f"  Num examples = {num_examples}")
+    print(f"  Num steps = {num_steps}")
+    print(f"  Batch size = {batch_size}\n")
+
+    parserUtils = ParserUtils("utf-8")
+
+    # world_size = max(1, trainer.args.world_size)
+    # eval_losses_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=batch_size)
+
+    trainer.model.eval()
+
+    trainer.callback_handler.eval_dataloader = d4j_dataloader
+
+    total_predictions = 0
+    generated_tests_by_name_column: dict[str, list[str]] = {}
+    # scores_by_name_column: dict[str, list[str]] = {}
+    predictions_without_test_annotation = 0
+    corrects_by_pos_after_changes = None
+    predictions_with_error_in_all_segment = 0
+    corrects_by_pos_before_changes = []
+    for i in range(num_return_sequences):
+        corrects_by_pos_before_changes.append([i, 0])
+    
+    count_steps = 1
+    remaining_examples = num_examples
+    # remaining_steps = num_steps
+
+    with torch.no_grad():
+        for step, inputs in enumerate(d4j_dataloader):
+            # inputs = tokenizer(d4j_dataset, return_tensors="pt", padding=True, truncation=True)
+
+            # print(f"\n\n\nStep: {step}")
+            # print(inputs)
+
+            step_batch_size = batch_size if count_steps < num_steps else remaining_examples
+            count_steps += 1
+            remaining_examples -= step_batch_size
+            # remaining_steps -= 1
+
+            # print(f"\n\nStep: {count_steps} -> step_batch_size: {step_batch_size} - remaining_examples: {remaining_examples}")
+            output = trainer.model.generate(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],  # Máscara de atención para el padding
+                eos_token_id=tokenizer.eos_token_id,
+                decoder_start_token_id = decoder_start_token_id,
+                max_length=max_length,  # Longitud máxima de la secuencia generada
+                num_beams=num_beams,    # Número de beams (más beams = mejor calidad, pero más lento)
+                num_return_sequences=num_return_sequences,  # Número de secuencias a devolver por cada entrada
+                do_sample=False,
+                early_stopping=True,           # Detiene la generación si todos los beams convergen
+                output_scores=True,            # Habilitar el cálculo de las probabilidades
+                return_dict_in_generate=True,  # Devolver un diccionario con los resultados
+
+                num_beam_groups=4,      # Divide los beams en grupos
+                diversity_penalty=1.0,  # Fuerza diversidad entre grupos
+
+                repetition_penalty=1.5,  # Valores típicos entre 1.0 y 2.0. Penaliza tokens ya generados, reduciendo la probabilidad de repeticiones.
+                no_repeat_ngram_size=4,  # Evita que se repitan cuatrigramas
+            )
+
+
+            # print(f"\n\nData step {step}")
+            sequences = output.sequences  # Todas las secuencias generadas
+            # print(f"Sequences shape: {sequences.shape}")
+            scores = output.sequences_scores  # Log-probabilidades de cada secuencia
+            # print(f"Scores shape: {scores.shape}")
+
+            # sequences.cpu() # Esto lo haríamos para usar Numpy
+            # sequences = np.where(sequences != -100, sequences, tokenizer.pad_token_id)
+
+            # Separar las secuencias y puntuaciones por entrada
+            sequences = sequences.reshape(step_batch_size, num_return_sequences, -1)  # (batch_size, num_return_sequences, seq_len)
+            scores = scores.reshape(step_batch_size, num_return_sequences)  # (batch_size, num_return_sequences)
+
+            # Procesar cada entrada del batch
+            for i in range(step_batch_size):
+                # Obtener las secuencias y puntuaciones para esta entrada
+                entry_sequences = sequences[i]
+                entry_scores = scores[i]
+
+                entry_sequences_decoded = [tokenizer.decode(seq, skip_special_tokens=True) for seq in entry_sequences]
+                total_predictions += len(entry_sequences_decoded)
+
+                # Combinar las secuencias con sus probabilidades
+                sequence_prob_pairs = list(zip(entry_sequences_decoded, entry_scores))
+                #sequence_prob_pairs = list(zip(entry_sequences, entry_scores))
+
+                # Ordenar las secuencias según su probabilidad (de mayor a menor)
+                sorted_sequence_prob_pairs = sorted(sequence_prob_pairs, key=lambda x: x[1], reverse=True)
+
+                some_prediction_by_input_is_correct = False
+                num_gen_test = 1
+                for j, (seq, log_prob) in enumerate(sorted_sequence_prob_pairs):
+                    if not seq.startswith("@Test"):
+                        predictions_without_test_annotation += 1
+                    
+                    code_has_errors = parserUtils.validate_if_code_has_errors(seq)
+
+                    if code_has_errors == False:
+                        corrects_by_pos_before_changes[num_gen_test-1][1] += 1
+                        some_prediction_by_input_is_correct = True
+
+
+                    name_column = 'generated_test_' + str(num_gen_test)
+                    if name_column in generated_tests_by_name_column:
+                        generated_tests_by_name_column[name_column].append(seq)
+                    else:
+                        generated_tests_by_name_column[name_column] = [seq]
+
+                    # log_prob is a Tensor with a float value
+                    # name_column_score = 'score_test_' + str(num_gen_test)
+                    # if name_column_score in scores_by_name_column:
+                    #     scores_by_name_column[name_column_score].append(log_prob)
+                    # else:
+                    #     scores_by_name_column[name_column_score] = [log_prob]
+
+                    num_gen_test += 1
+                
+                if not some_prediction_by_input_is_correct:
+                    predictions_with_error_in_all_segment += 1
+
+
+            trainer.control = trainer.callback_handler.on_prediction_step(trainer.args, trainer.state, trainer.control)
+
+    # predictions = np.where(sequences != -100, sequences, tokenizer.pad_token_id)
+    # print(f"\n\nPredictions: {predictions.shape}")
+    #print(predictions)
+
+    metrics = speed_metrics(
+        project_name,
+        start_time,
+        num_samples=num_examples,
+        num_steps=num_steps,
+    )
+
+    trainer.control = trainer.callback_handler.on_predict(trainer.args, trainer.state, trainer.control, metrics)
+
+    total_outputs = len(d4j_dataset["id"])
+    num_results = num_return_sequences
+    prediction_results = {
+        'id': d4j_dataset['id'], 
+        'project': d4j_dataset['project'], 
+        'version': d4j_dataset['version'], 
+        'number_method_by_version': d4j_dataset['number_method_by_version'], 
+        'modified_class': d4j_dataset['modified_class'], 
+        'focal_method': d4j_dataset['focal_method'], 
+        'focal_class': d4j_dataset['focal_class'], 
+        'path_focal_class_in_project': d4j_dataset['path_focal_class_in_project'], 
+        'test_class': d4j_dataset['test_class'], 
+        'path_test_class': d4j_dataset['path_test_class'], 
+        'package_focal_class': d4j_dataset['package_focal_class'], 
+        'imports_focal_class': d4j_dataset['imports_focal_class'], 
+        'num_results': [num_results] * total_outputs
+    }
+    # prediction_results.update(scores_by_name_column)
+    prediction_results.update(generated_tests_by_name_column)
+
+
+    print("")
+    trainer.log_metrics(project_name, metrics)
+    metrics.update(
+        {
+            f"{project_name}_runtime_formatted": secs2timedelta(metrics[f"{project_name}_runtime"]),
+            f"{project_name}_samples": num_examples,
+            f"{project_name}_steps": num_steps,
+        }
+    )
+    trainer.save_metrics(project_name, metrics)
+
+    print(f"\ncorrects_by_pos_before_changes: {str(corrects_by_pos_before_changes)}")
+    print(f"\npredictions_with_error_in_all_segment: {str(predictions_with_error_in_all_segment)}")
+    print(f"\npredictions_without_test_annotation: {str(predictions_without_test_annotation)}\n")
+
+    return prediction_results, total_predictions, corrects_by_pos_before_changes, corrects_by_pos_after_changes, predictions_with_error_in_all_segment, predictions_without_test_annotation, metrics
+
 
 
 def d4j_predicts(tokenizer, 
@@ -451,10 +784,11 @@ def d4j_predicts(tokenizer,
         'version': d4j_dataset['version'], 
         'number_method_by_version': d4j_dataset['number_method_by_version'], 
         'modified_class': d4j_dataset['modified_class'], 
+        'focal_method': d4j_dataset['focal_method'], 
         'focal_class': d4j_dataset['focal_class'], 
         'path_focal_class_in_project': d4j_dataset['path_focal_class_in_project'], 
         'test_class': d4j_dataset['test_class'], 
-        'path_test_class_scaffolding': d4j_dataset['path_test_class_scaffolding'], 
+        'path_test_class': d4j_dataset['path_test_class'], 
         'package_focal_class': d4j_dataset['package_focal_class'], 
         'imports_focal_class': d4j_dataset['imports_focal_class'], 
         #'num_results': [num_results for i in range(segment_length)],
@@ -463,12 +797,12 @@ def d4j_predicts(tokenizer,
 
     index = 1
     predictions_without_test_annotation = 0
-    for list_segment_predicts in segmented_predictions:
+    for list_segment_generated_test_i_predicts in segmented_predictions:
         #print(list_segment_predicts)
-        for generated_tets in list_segment_predicts:
+        for generated_tets in list_segment_generated_test_i_predicts:
             if not generated_tets.startswith("@Test"):
                 predictions_without_test_annotation += 1
-        prediction_results['generated_test_' + str(index)] = list_segment_predicts
+        prediction_results['generated_test_' + str(index)] = list_segment_generated_test_i_predicts
         index += 1
 
     trainer.log_metrics(project_name, predict_outputs.metrics)
@@ -520,7 +854,7 @@ def list_predictions_getting_first_not_wrong(parserUtils: ParserUtils, list_pred
                 # print(code_without_missings)
                 # print("")
             else:
-                code_before_fixed_has_errors, code_without_missings = parserUtils.fix_missings_in_code(code_before_changes)
+                code_before_fixed_has_errors, code_without_missings = parserUtils.fix_missings_and_errors_in_code(code_before_changes)
 
             code_after_fixed_has_errors = parserUtils.validate_if_code_has_errors(code_without_missings)
             
@@ -574,6 +908,9 @@ def list_predictions_getting_first_not_wrong(parserUtils: ParserUtils, list_pred
 
 
 def only_validate_if_predictions_has_errors(parserUtils: ParserUtils, list_predictions: list, num_return_sequences: int):
+    """
+    Con esta función, se valida por cada output si tiene error de sintaxis o no
+    """
     predictions_with_error_in_all_segment = 0
     corrects_by_pos_before_changes = []
     for i in range(num_return_sequences):
@@ -736,13 +1073,19 @@ if __name__ == '__main__':
     print(f"Device: {device}  |  Accelerator: {accelerator}")
 
     if useFp16 and useBf16:
-        raise "Debe indicar un solo tipo de precision: fp16 o bf16"
+        raise "Debe indicar un solo tipo de precision: fp16 o bf16. Si no indica ninguno, por defecto será fp32"
     
     half_precision_backend = "auto" # por defecto
     if useBf16:
         half_precision_backend = "cpu_amp" # bf16 solo se puede ejecutar sobre CPU o sobre NVIDIA con arquitectura AMP o superior
 
-    print(f"Precision: useFp16={useFp16}, useBf16={useBf16}  |  Half Precision Backend: {half_precision_backend}")
+    precision = "fp32"
+    if useFp16:
+        precision = "fp16"
+    elif useBf16:
+        precision = "bf16"
+
+    print(f"Precision: {precision}  |  Half Precision Backend: {half_precision_backend}")
 
 
     # Load tokenizer from existing one to re-use special tokens
@@ -869,22 +1212,39 @@ if __name__ == '__main__':
         partial_predict_dataset = tokenized_datasets[project]
         actualProject = project
 
-        (prediction_results, 
-         total_predictions,
-         corrects_by_pos_before_changes, 
-         corrects_by_pos_after_changes, 
-         predictions_with_error_in_all_segment, 
-         predictions_without_test_annotation,
-         predict_outputs_metrics) = d4j_predicts(
-                tokenizer=tokenizer, 
-                decoder_start_token_id=decoder_start_token_id,
-                max_length=max_seq_length,
-                trainer=trainer, 
-                project_name=project,
-                d4j_dataset=partial_predict_dataset, 
-                generation_strategy=generationStrategy,
-                num_return_sequences=numReturnPredictions
-        )
+        if generationStrategy == 'beam_search' and "A3Test" not in inputModel:
+            (prediction_results, 
+            total_predictions,
+            corrects_by_pos_before_changes, 
+            corrects_by_pos_after_changes, 
+            predictions_with_error_in_all_segment, 
+            predictions_without_test_annotation,
+            predict_outputs_metrics) = sorted_by_score_d4j_predicts(
+                    trainer=trainer,
+                    tokenizer=tokenizer, 
+                    d4j_dataset=partial_predict_dataset, 
+                    project_name=project, 
+                    max_length=max_seq_length, 
+                    num_beams=numBeamsPredictions, 
+                    num_return_sequences=numReturnPredictions
+            )
+        else:
+            (prediction_results, 
+            total_predictions,
+            corrects_by_pos_before_changes, 
+            corrects_by_pos_after_changes, 
+            predictions_with_error_in_all_segment, 
+            predictions_without_test_annotation,
+            predict_outputs_metrics) = d4j_predicts(
+                    tokenizer=tokenizer, 
+                    decoder_start_token_id=decoder_start_token_id,
+                    max_length=max_seq_length,
+                    trainer=trainer, 
+                    project_name=project,
+                    d4j_dataset=partial_predict_dataset, 
+                    generation_strategy=generationStrategy,
+                    num_return_sequences=numReturnPredictions
+            )
         total_outputs_records = len(prediction_results['id'])
 
         save_prediction_results_in_csv(project, outputPath, prediction_results)
@@ -915,6 +1275,8 @@ if __name__ == '__main__':
     elapsed_time_all_predicts = end_time_all_predicts - start_time_all_predicts
     elapsed_time_all_predicts_formatted = secs2timedelta(elapsed_time_all_predicts)
     predict_metrics.append("\n\nALL PREDICTIONS RESULTS:\n")
+    predict_metrics.append(f"Model: {inputModel}")
+    # predict_metrics.append(f"Precision: {precision}")
     predict_metrics.append(f"Elapsed time: {elapsed_time_all_predicts} seconds")
     predict_metrics.append(f"Elapsed time (formatted): {elapsed_time_all_predicts_formatted}")
     
